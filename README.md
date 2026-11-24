@@ -1,29 +1,21 @@
 # importprobe
 
+[![npm](https://img.shields.io/npm/v/importprobe)](https://www.npmjs.com/package/importprobe)
+[![CI](https://github.com/KaanKaya17/importprobe/actions/workflows/ci.yml/badge.svg)](https://github.com/KaanKaya17/importprobe/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/importprobe)](LICENSE)
+
 **Catch what your AI coding agent made up — before it runs.**
 
 AI assistants write code that is *almost* right: an import from a package that
 doesn't exist, a function the package never exported, a method from a different
-library or an older major version, a dependency nobody added to `package.json`.
-importprobe checks every import and API call against the real package.
+library or an older major version, a typo'd package name that an attacker
+registered. importprobe checks every import and API call against the real package.
 
-```
-$ npx importprobe
+![importprobe finding made-up imports and API calls](docs/demo.svg)
 
-src/hallucinated.tsx
-  2:26  ✖ error  react-router-dom@7.18.6 has no export named "useHistory".
-                 → note: "useHistory" was removed: it last existed in v5 (react-router-dom@5.3.4).
-  3:10  ✖ error  react-dom@19.3.1 has no export named "render".
-                 → note: "render" was removed: it last existed in v18 (@types/react-dom@18.3.7).
-  5:10  ✖ error  dayjs@1.11.23 has no export named "addDays".
-                 → note: "addDays" is exported by date-fns (already in your package.json).
- 16:33  ✖ error  "emailAddress" does not exist on ZodString (from zod@4.6.7).
-                 → did you mean: .email
- 18:5   ✖ error  "listenAsync" does not exist on Express (from @types/express-serve-static-core@5.1.3).
-                 → did you mean: .listen
-src/api.ts
-  3:30  ✖ error  "axios-retry-pro" does not exist on npm — most likely made up by an AI.
-                 → did you mean: axios-retry, axios-pro, retry-pro
+```bash
+npx importprobe          # check the current project
+npx importprobe init     # make your AI agent check its own code (Claude Code, Cursor, VS Code)
 ```
 
 ## What it checks
@@ -31,7 +23,8 @@ src/api.ts
 | Problem | Example | Rule |
 |---|---|---|
 | Package doesn't exist | `import x from 'axios-retry-pro'` | `unknown-package` |
-| Package is brand new / barely used (slopsquatting risk) | an invented name someone registered last week | `suspicious-package` |
+| Typosquat or brand-new / barely used package | `expresss`, `loadsh`, a name registered last week | `suspicious-package` |
+| Deprecated package | `request` | `deprecated-package` |
 | Real package, not in package.json, not installed | `import { nanoid } from 'nanoid'` | `missing-dependency` |
 | Works only by accident (transitive) | `import mime from 'mime-types'` | `undeclared-dependency` |
 | Export doesn't exist | `import { formatRelative } from 'dayjs'` | `unknown-export` |
@@ -40,11 +33,13 @@ src/api.ts
 | Node built-ins | `node:paths`, `readJsonSync` from `node:fs` | `unknown-builtin`, `unknown-export` |
 | Local files | missing file, wrong export name, default import of a named-only module | `missing-file`, `unknown-export`, `no-default-export` |
 
+Works on `.js .jsx .ts .tsx .mjs .cjs` and the scripts of **`.vue`, `.svelte` and `.astro`** files.
+
 And it explains *why*, so the fix is obvious:
 
-- **"was removed in vX" / "was added in vY"** — checks older and newer majors of the package (or its `@types`).
-- **"is exported by date-fns (already in your package.json)"** — the AI mixed up two libraries.
-- **"did you mean"** — closest real names, preferring runnable values over type-only exports.
+- **"was removed: it last existed in v5"** / **"was added in v8"** — checks other majors of the package (or its `@types`).
+- **"is exported by date-fns"** — the AI mixed up two libraries (your dependencies, Node built-ins, and a built-in index of ~100 popular packages).
+- **"did you mean"** — closest real names. Suggested packages must themselves be established (≥ 1,000 downloads/week); deprecated ones are marked.
 
 **It checks the real package without installing it.** When a package isn't
 installed, importprobe downloads the published tarball, keeps only declaration /
@@ -69,10 +64,25 @@ npx importprobe --sarif > importprobe.sarif   # GitHub code scanning
 Exit code `1` when errors are found (`--strict`: warnings too), `0` when clean.
 In a monorepo each file is checked against its own nearest `package.json`.
 
-### Let your AI agent fix its own mistakes (Claude Code hook)
+### Let your AI agent check — and fix — its own code
 
-Add to `.claude/settings.json`. After every file the agent writes, importprobe
-checks it; if anything is invented, the agent gets the list back and fixes it.
+```bash
+npx importprobe init            # detects .claude / .cursor / .vscode
+npx importprobe init claude cursor vscode --dry-run
+```
+
+`init` merges into your existing config files (it never drops your settings and
+leaves files with comments untouched, printing what to add instead):
+
+| Agent | What it adds |
+|---|---|
+| Claude Code | a `PostToolUse` hook in `.claude/settings.json` — after every file the agent writes, invented imports go straight back to the agent — plus the MCP server in `.mcp.json` |
+| Cursor | the MCP server in `.cursor/mcp.json` |
+| VS Code | the MCP server in `.vscode/mcp.json` |
+
+<details><summary>Manual setup</summary>
+
+Claude Code hook (`.claude/settings.json`):
 
 ```json
 {
@@ -85,11 +95,15 @@ checks it; if anything is invented, the agent gets the list back and fixes it.
 }
 ```
 
-### Let your agent look things up instead of guessing (MCP)
+MCP server, any client: command `npx`, args `["-y", "importprobe", "mcp"]`
+(on native Windows: command `cmd`, args `["/c", "npx", "-y", "importprobe", "mcp"]`).
 
 ```bash
 claude mcp add importprobe -- npx -y importprobe mcp
 ```
+</details>
+
+### MCP tools: look things up instead of guessing
 
 | Tool | What the agent gets |
 |---|---|
@@ -97,35 +111,54 @@ claude mcp add importprobe -- npx -y importprobe mcp
 | `check_package` | Does it exist? How old, how popular, deprecated? Similar real names if not. |
 | `check_files` | Everything the CLI checks, as agent-ready feedback. |
 
-Works with any MCP client (Cursor, VS Code, Windsurf…): command `npx`, args `["-y", "importprobe", "mcp"]`.
+importprobe is listed in the [MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.KaanKaya17/importprobe`.
 
-### GitHub Actions
+### GitHub Action
+
+Annotates the pull request on the exact lines, writes a job summary, and can produce SARIF:
 
 ```yaml
-- run: npx importprobe --sarif > importprobe.sarif || true
-- uses: github/codeql-action/upload-sarif@v3
+- uses: KaanKaya17/importprobe@v0.1.1 # or pin the commit SHA
+  with:
+    path: src            # default: .
+    fail-on: error       # error | warning | never
+    sarif: importprobe.sarif   # optional
+- uses: github/codeql-action/upload-sarif@v3   # optional: show in the Security tab
+  if: always()
   with: { sarif_file: importprobe.sarif }
 ```
+
+Outputs: `errors`, `warnings`. The action runs the importprobe code of the ref you
+pinned; it does not download anything else at run time (except registry lookups).
 
 ## How it works
 
 1. Pre-scans files for module specifiers (static, dynamic `import()`, `require`, re-exports).
-2. For each package: is it declared? installed? on npm? how old, how popular?
+2. For each package: is it declared? installed? on npm? how old, how popular, deprecated, a typo of a popular name?
 3. Fetches declarations for packages that aren't installed (+ matching-major `@types/*`).
 4. Builds one TypeScript program (with your project's `.d.ts` files and resolution settings)
    and asks the checker what each module really exports and what each value really has.
-5. For misses, looks at other major versions and your other dependencies to explain them.
+5. For misses, looks at other major versions, your other dependencies and a built-in index to explain them.
 
 Exports inferred from plain-JavaScript packages (no types) can be incomplete, so
 those findings are warnings, not errors.
 
-## Privacy
+## Cache and privacy
 
-Only public registry endpoints are called (`registry.npmjs.org`,
-`api.npmjs.org`), and only with package names. Your code never leaves your
-machine. Results are cached in one folder (`%LOCALAPPDATA%\importprobe\cache`,
-`$XDG_CACHE_HOME/importprobe` or `~/.cache/importprobe`; override with
-`IMPORTPROBE_CACHE`). `--offline` disables the network entirely.
+Only public registry endpoints are called (`registry.npmjs.org`, `api.npmjs.org`),
+and only with package names — including names of the packages your code imports,
+so private package names are sent too unless you use `--offline`. Your code never
+leaves your machine.
+
+Downloads and registry answers are cached in one folder (`%LOCALAPPDATA%\importprobe\cache`,
+`$XDG_CACHE_HOME/importprobe` or `~/.cache/importprobe`; override with `IMPORTPROBE_CACHE`).
+It is kept under 200 MB (`IMPORTPROBE_CACHE_MAX_MB`): entries unused for 30 days, then the
+least recently used ones, are removed automatically.
+
+```bash
+npx importprobe cache          # where, how big
+npx importprobe cache clean    # remove everything importprobe downloaded
+```
 
 ## Development
 
@@ -134,8 +167,13 @@ npm install
 npm run demo:setup   # installs both sample apps' dependencies (scripts disabled)
 npm run demo         # run against test/fixtures/ai-app
 npm test
+npm run smoke        # pack, install the tarball, run it
+node scripts/build-index.mjs   # refresh the built-in export index
+node scripts/render-demo.mjs   # refresh docs/demo.svg
 IMPORTPROBE_DEBUG=1 npx importprobe   # phase timings (=files: biggest packages loaded)
 ```
+
+Releasing: see [RELEASING.md](RELEASING.md).
 
 ## License
 

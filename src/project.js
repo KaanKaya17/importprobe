@@ -3,7 +3,7 @@ import { join, dirname, resolve, extname, relative } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import ts from 'typescript';
 
-export const SOURCE_EXT = new Set(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts']);
+export const SOURCE_EXT = new Set(['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts', '.vue', '.svelte', '.astro']);
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.next', '.nuxt', '.output', 'out', '.turbo', '.vercel', '.svelte-kit']);
 
 export function isSourceFile(file) {

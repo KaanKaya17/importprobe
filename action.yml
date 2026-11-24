@@ -1,0 +1,67 @@
+name: importprobe
+description: Catch imports and API calls an AI made up — annotated on the pull request.
+author: Kaan Kaya
+branding:
+  icon: search
+  color: purple
+
+inputs:
+  path:
+    description: Files or folders to check (space-separated).
+    default: '.'
+  args:
+    description: Extra CLI arguments, e.g. "--fast" or "--offline" or "--strict".
+    default: ''
+  fail-on:
+    description: Fail the step on "error" (default), "warning", or "never".
+    default: error
+  sarif:
+    description: Optional path to also write a SARIF file (for github/codeql-action/upload-sarif).
+    default: ''
+
+outputs:
+  errors:
+    description: Number of errors found.
+    value: ${{ steps.run.outputs.errors }}
+  warnings:
+    description: Number of warnings found.
+    value: ${{ steps.run.outputs.warnings }}
+
+runs:
+  using: composite
+  steps:
+    # Runs the importprobe code of the exact ref you pinned (no npx download at run time).
+    - name: Install importprobe
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: npm ci --omit=dev --ignore-scripts --no-audit --no-fund --loglevel=error
+
+    - name: Check imports
+      id: run
+      shell: bash
+      env:
+        IP_PATH: ${{ inputs.path }}
+        IP_ARGS: ${{ inputs.args }}
+        IP_FAIL_ON: ${{ inputs.fail-on }}
+        IP_SARIF: ${{ inputs.sarif }}
+        IP_BIN: ${{ github.action_path }}/bin/importprobe.js
+      run: |
+        set +e
+        sarif=()
+        [ -n "$IP_SARIF" ] && sarif=(--sarif-file "$IP_SARIF")
+        # shellcheck disable=SC2086 # word splitting of path/args is intended
+        node "$IP_BIN" --github "${sarif[@]}" $IP_ARGS $IP_PATH > importprobe-out.txt
+        code=$?
+        set -e
+        cat importprobe-out.txt
+        errors=$(grep -c '^::error' importprobe-out.txt || true)
+        warnings=$(grep -c '^::warning' importprobe-out.txt || true)
+        rm -f importprobe-out.txt
+        echo "errors=$errors" >> "$GITHUB_OUTPUT"
+        echo "warnings=$warnings" >> "$GITHUB_OUTPUT"
+        if [ "$code" -ge 2 ]; then echo "::error::importprobe failed to run (exit $code)"; exit "$code"; fi
+        case "$IP_FAIL_ON" in
+          never) exit 0 ;;
+          warning) [ $((errors + warnings)) -eq 0 ] ;;
+          *) [ "$errors" -eq 0 ] ;;
+        esac

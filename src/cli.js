@@ -1,10 +1,11 @@
 import { parseArgs } from 'node:util';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, appendFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { analyze } from './analyze.js';
 import { collectFiles, changedFiles, findRoot, loadProject, isSourceFile } from './project.js';
-import { formatPretty, formatJson, formatForAgent, formatSarif } from './report.js';
+import { formatPretty, formatJson, formatForAgent, formatSarif, formatGithub } from './report.js';
+import { cacheDir, cacheInfo, cleanCache, pruneCache } from './cache.js';
 
 const VERSION = JSON.parse(readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../package.json'), 'utf8')).version;
 
@@ -17,10 +18,14 @@ Usage
   importprobe --changed                 check files changed in git
   importprobe hook                      run as a Claude Code PostToolUse hook (reads stdin)
   importprobe mcp                       run as an MCP server (list_exports, check_package, check_files)
+  importprobe init [claude|cursor|vscode]  set up the hook and/or MCP server for your editor/agent
+  importprobe cache [info|prune|clean]  show or clear the download cache
 
 Options
   --json          machine-readable output
   --sarif         SARIF 2.1.0 for GitHub code scanning
+  --sarif-file F  also write SARIF to file F
+  --github        GitHub Actions annotations (+ job summary)
   --fast          skip chained-call checks and version/package hints
   --offline       never contact the npm registry
   --strict        exit 1 on warnings too
@@ -40,11 +45,15 @@ export async function main(argv) {
       options: {
         json: { type: 'boolean' },
         sarif: { type: 'boolean' },
+        'sarif-file': { type: 'string' },
+        github: { type: 'boolean' },
         fast: { type: 'boolean' },
         offline: { type: 'boolean' },
         strict: { type: 'boolean' },
         verbose: { type: 'boolean' },
         changed: { type: 'boolean' },
+        yes: { type: 'boolean', short: 'y' },
+        'dry-run': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
         version: { type: 'boolean', short: 'v' },
       },
@@ -58,6 +67,8 @@ export async function main(argv) {
   if (o.version) { process.stdout.write(`${VERSION}\n`); return 0; }
   if (positionals[0] === 'hook') return runHook(o);
   if (positionals[0] === 'mcp') return (await import('./mcp.js')).runMcp(VERSION);
+  if (positionals[0] === 'cache') return runCache(positionals[1]);
+  if (positionals[0] === 'init') return (await import('./init.js')).runInit(positionals.slice(1), o);
 
   const cwd = process.cwd();
   let files;
@@ -74,13 +85,42 @@ export async function main(argv) {
   }
 
   const result = await analyzeByProject(files, { offline: o.offline, deep: !o.fast, hints: !o.fast });
-  const out = o.sarif ? formatSarif(result, { cwd, version: VERSION })
-    : o.json ? formatJson(result, { cwd, version: VERSION })
-      : formatPretty(result, { cwd, verbose: o.verbose, version: VERSION });
+  let out;
+  if (o.github) {
+    const gh = formatGithub(result, { cwd, version: VERSION });
+    out = gh.text;
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      try { appendFileSync(process.env.GITHUB_STEP_SUMMARY, gh.summary + '\n'); } catch { /* not in Actions */ }
+    }
+  } else if (o.sarif) out = formatSarif(result, { cwd, version: VERSION });
+  else if (o.json) out = formatJson(result, { cwd, version: VERSION });
+  else out = formatPretty(result, { cwd, verbose: o.verbose, version: VERSION });
   process.stdout.write(out + '\n');
+  if (o['sarif-file']) writeFileSync(o['sarif-file'], formatSarif(result, { cwd, version: VERSION }) + '\n');
+  try { pruneCache(); } catch { /* never fail a check because of the cache */ }
   const errors = result.findings.some((f) => f.severity === 'error');
   const warnings = result.findings.some((f) => f.severity === 'warning');
   return errors || (o.strict && warnings) ? 1 : 0;
+}
+
+const mb = (b) => `${(b / 1024 / 1024).toFixed(1)} MB`;
+
+function runCache(sub = 'info') {
+  if (sub === 'clean') {
+    process.stdout.write(`Removed ${mb(cleanCache())} from ${cacheDir()}\n`);
+    return 0;
+  }
+  if (sub === 'prune') {
+    process.stdout.write(`Freed ${mb(pruneCache({ force: true }))}\n`);
+    return 0;
+  }
+  if (sub !== 'info') {
+    process.stderr.write('Usage: importprobe cache [info|prune|clean]\n');
+    return 2;
+  }
+  const i = cacheInfo();
+  process.stdout.write(`${i.dir}\n${mb(i.bytes)} in ${i.packages} downloaded package version(s) and ${i.entries - i.packages} registry answer(s); limit ${mb(i.limitBytes)} (IMPORTPROBE_CACHE_MAX_MB)\n`);
+  return 0;
 }
 
 /**

@@ -46,6 +46,18 @@ test('chained inventions in plain JS are caught; JS-style narrowing is not repor
   assert.deepEqual(ok.findings, []);
 });
 
+test('Vue, Svelte and Astro: correct components are clean, mistakes are found at exact positions', { skip }, async () => {
+  const good = await analyze({ files: collectFiles([join(app, 'src', 'sfc-good')]), project: project(), offline: true });
+  assert.deepEqual(good.findings, []);
+  const bad = await analyze({ files: collectFiles([join(app, 'src', 'sfc-bad')]), project: project(), offline: true });
+  assert.deepEqual(bad.findings.map((f) => `${basename(f.file)}:${f.line}:${f.column} ${f.rule}`).sort(), [
+    'Bad.svelte:2:12 unknown-export',
+    'Bad.svelte:4:28 unknown-member',
+    'Page.astro:10:18 unknown-export',
+    'Page.astro:5:3 unknown-member',
+  ]);
+});
+
 test('fast mode skips chained checks', { skip }, async () => {
   const result = await analyze({ files: collectFiles([join(app, 'src', 'bad')]), project: project(), offline: true, deep: false, hints: false });
   assert.ok(!result.findings.some((f) => f.line === 16), 'z.string().emailAddress() is a deep check');

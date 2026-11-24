@@ -57,6 +57,23 @@ export function getPackage(name) {
   });
 }
 
+/**
+ * Deprecation message of one published version, from the small per-version
+ * manifest (the full package document can be megabytes). null = not deprecated.
+ */
+export function deprecationOf(name, version) {
+  return once(`dep:${name}@${version}`, async () => {
+    const key = `${name}@${version}`;
+    const cached = readCache('deprecations', key, 7 * DAY);
+    if (cached !== undefined) return cached;
+    const doc = await getJson(`${REGISTRY}/${enc(name)}/${encodeURIComponent(version)}`).catch(() => undefined);
+    if (doc === undefined) return null; // network trouble: say nothing
+    const msg = typeof doc?.deprecated === 'string' && doc.deprecated.trim() ? doc.deprecated.trim() : null;
+    writeCache('deprecations', key, msg);
+    return msg;
+  });
+}
+
 export function weeklyDownloads(name) {
   return once(`dl:${name}`, async () => {
     const cached = readCache('downloads', name, DAY);
@@ -68,45 +85,132 @@ export function weeklyDownloads(name) {
   });
 }
 
+// A suggestion must itself be safe to install: suggesting a barely used or
+// brand-new name to an AI is exactly the slopsquatting risk we warn about.
+const MIN_SUGGESTION_DOWNLOADS = 1000;
+const MIN_SUGGESTION_AGE_DAYS = 30;
+
+/** Latest version + its deprecation, from the small per-version manifest. */
+export function latestManifest(name) {
+  return once(`latest:${name}`, async () => {
+    const cached = readCache('latest', name, DAY);
+    if (cached !== undefined) return cached;
+    const doc = await getJson(`${REGISTRY}/${enc(name)}/latest`).catch(() => undefined);
+    if (doc === undefined) return null;
+    const out = doc?.version ? { version: doc.version, deprecated: typeof doc.deprecated === 'string' && doc.deprecated ? doc.deprecated : null } : null;
+    writeCache('latest', name, out);
+    return out;
+  });
+}
+
+async function suggestionInfo(n) {
+  // Cheap checks only: the full package document of e.g. "react" is megabytes.
+  const downloads = await weeklyDownloads(n);
+  if (!downloads || downloads < MIN_SUGGESTION_DOWNLOADS) return null;
+  const latest = await latestManifest(n);
+  if (!latest) return null;
+  return { name: n, downloads, deprecated: !!latest.deprecated };
+}
+
+/** Name variants with one or two words dropped: "react-query-helpers-pro" → "react-query", … */
+function shorterNames(name) {
+  const scope = name.startsWith('@') ? name.split('/')[0] + '/' : '';
+  const words = name.slice(scope.length).split(/[-_.]/).filter(Boolean);
+  const out = new Set();
+  const n = words.length;
+  for (let mask = 1; mask < (1 << n) - 1; mask++) {
+    const kept = words.filter((_, i) => mask & (1 << i));
+    const dropped = n - kept.length;
+    if (dropped > 2 || (kept.length === 1 && kept[0].length < 4)) continue;
+    out.add(scope + kept.join('-'));
+  }
+  if (scope) out.add(name.slice(scope.length));
+  out.delete(name);
+  return { words, names: [...out] };
+}
+
+/** One-keystroke variants: a deleted, swapped, or separator character ("expresss" → "express"). */
+export function typoVariants(name) {
+  const scope = name.startsWith('@') ? name.slice(0, name.indexOf('/') + 1) : '';
+  const s = name.slice(scope.length);
+  const out = new Set();
+  for (let i = 0; i < s.length; i++) out.add(s.slice(0, i) + s.slice(i + 1)); // deletion
+  for (let i = 0; i < s.length - 1; i++) out.add(s.slice(0, i) + s[i + 1] + s[i] + s.slice(i + 2)); // swap
+  out.add(s.replace(/[-_.]/g, '')); // react-dom vs reactdom
+  for (const sep of ['-', '_', '.']) out.add(s.replace(/[-_.]/g, sep));
+  for (let i = 1; i < s.length; i++) if (!/[-_.]/.test(s[i - 1] + s[i])) out.add(s.slice(0, i) + '-' + s.slice(i)); // missing hyphen
+  out.delete(s);
+  return [...out].filter((v) => v.length >= 2 && /^[a-z0-9][a-z0-9._-]*$/.test(v)).map((v) => scope + v);
+}
+
+/** Weekly downloads for many unscoped packages in one request (npm bulk API, max 128). */
+async function bulkDownloads(names) {
+  const out = new Map();
+  const unscoped = names.filter((n) => !n.startsWith('@'));
+  for (let i = 0; i < unscoped.length; i += 128) {
+    const chunk = unscoped.slice(i, i + 128);
+    const doc = await getJson(`${DOWNLOADS}/${chunk.join(',')}`).catch(() => null);
+    if (chunk.length === 1 && doc?.downloads !== undefined) out.set(chunk[0], doc.downloads);
+    else for (const [n, v] of Object.entries(doc || {})) if (v?.downloads) out.set(n, v.downloads);
+  }
+  for (const n of names.filter((x) => x.startsWith('@'))) {
+    const d = await weeklyDownloads(n);
+    if (d) out.set(n, d);
+  }
+  return out;
+}
+
 /**
- * Real packages with names close to `name`, best first.
- * AIs usually invent names by bolting a word onto a real package
- * ("axios-retry-pro"), so names with one word dropped are tried first.
+ * Popular packages one keystroke away from `name` ("expresss" → express),
+ * most popular first. Used to flag typosquats.
+ */
+export function lookalikes(name) {
+  return once(`look:${name}`, async () => {
+    const cached = readCache('lookalikes', name, 7 * DAY);
+    if (cached !== undefined) return cached;
+    const counts = await bulkDownloads(typoVariants(name));
+    const scored = [...counts].map(([n, downloads]) => ({ name: n, downloads })).sort((a, b) => b.downloads - a.downloads).slice(0, 5);
+    writeCache('lookalikes', name, scored);
+    return scored;
+  });
+}
+
+/**
+ * Established packages with names close to `name`, best first.
+ * AIs usually invent names by bolting words onto a real package
+ * ("axios-retry-pro"), so names with one or two words dropped are tried first.
+ * Only packages with real usage are suggested; deprecated ones go last, marked.
  */
 export function similarPackages(name, max = 3) {
   return once(`sim:${name}`, async () => {
     const cached = readCache('search', name, 7 * DAY);
     if (cached !== undefined) return cached;
 
-    const scope = name.startsWith('@') ? name.split('/')[0] + '/' : '';
-    const words = name.slice(scope.length).split(/[-_.]/).filter(Boolean);
-    const derived = new Set();
-    for (let i = 0; i < words.length && words.length > 1; i++) {
-      derived.add(scope + words.filter((_, j) => j !== i).join('-'));
-    }
-    if (scope) derived.add(name.slice(scope.length));
-    // Real names derived by dropping one word, most-downloaded first: the real
-    // package (axios-retry) should beat lookalikes (retry-pro, axios-pro).
-    const exactScored = [];
-    for (const d of derived) {
-      if (d === name) continue;
-      const pkg = await getPackage(d).catch(() => null);
-      if (pkg && !pkg.unpublished) exactScored.push([(await weeklyDownloads(d)) ?? 0, d]);
-    }
-    const exact = exactScored.sort((a, b) => b[0] - a[0]).map(([, d]) => d);
+    const { words, names: derived } = shorterNames(name);
+    // Closest first: names that keep more of the original words, then typo fixes,
+    // then popularity. A deprecated match stays in place (it is what was meant) but is marked.
+    const kept = (n) => n.replace(/^@[^/]+\//, '').split(/[-_.]/).length;
+    const exact = (await Promise.all(derived.map(suggestionInfo))).filter(Boolean)
+      .sort((a, b) => kept(b.name) - kept(a.name) || b.downloads - a.downloads);
+    const typos = (await lookalikes(name).catch(() => [])).filter((l) => l.downloads >= MIN_SUGGESTION_DOWNLOADS);
 
-    const texts = [words.join(' '), words.slice(0, -1).join(' ')].filter(Boolean);
+    // Search results only count when they are actually close (few edits or most words shared).
     const found = new Set();
-    for (const text of new Set(texts)) {
-      const doc = await getJson(`${REGISTRY}/-/v1/search?text=${encodeURIComponent(text)}&size=20`).catch(() => null);
-      for (const o of doc?.objects || []) if (o.package.name !== name) found.add(o.package.name);
-    }
-    const ranked = [...found]
-      .filter((n) => !exact.includes(n))
-      .map((n) => [distance(name, n), n])
-      .sort((a, b) => a[0] - b[0])
-      .map(([, n]) => n);
-    const result = [...exact, ...ranked].slice(0, max);
+    const doc = await getJson(`${REGISTRY}/-/v1/search?text=${encodeURIComponent(words.join(' '))}&size=20`).catch(() => null);
+    for (const o of doc?.objects || []) if (o.package.name !== name && !derived.includes(o.package.name)) found.add(o.package.name);
+    const wa = new Set(words.map((w) => w.toLowerCase()));
+    const close = [...found].filter((n) => {
+      if (distance(name, n) <= Math.max(2, Math.floor(name.length / 4))) return true;
+      const wb = n.replace(/^@[^/]+\//, '').toLowerCase().split(/[-_.]/).filter(Boolean);
+      const shared = wb.filter((w) => wa.has(w)).length;
+      return shared >= 2 && shared / Math.max(wa.size, wb.length) >= 0.6;
+    });
+    const searched = (await Promise.all(close.slice(0, 6).map(suggestionInfo))).filter(Boolean);
+
+    const seen = new Set();
+    const ordered = [...exact.filter((e) => kept(e.name) > 1), ...typos, ...exact.filter((e) => kept(e.name) === 1), ...searched]
+      .filter((e) => !seen.has(e.name) && seen.add(e.name));
+    const result = ordered.slice(0, max).map((e) => (e.deprecated ? `${e.name} (deprecated)` : e.name));
     writeCache('search', name, result);
     return result;
   });

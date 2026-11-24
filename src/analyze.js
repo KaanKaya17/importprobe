@@ -1,16 +1,19 @@
 import ts from 'typescript';
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, basename } from 'node:path';
 import { isBuiltin } from 'node:module';
 import { classify, builtinNames, packageNameOf } from './specifier.js';
 import { suggest } from './suggest.js';
-import { getPackage, weeklyDownloads, similarPackages } from './registry.js';
+import { getPackage, weeklyDownloads, similarPackages, deprecationOf, lookalikes } from './registry.js';
 import { fetchForInspection } from './inspect.js';
 import { findInstalled } from './project.js';
 import { moduleNames, ownerOf, isDeclarationFile, virtualHost, lineStartsOf, lineCol } from './tsutil.js';
 import { findInHistory } from './history.js';
+import { readCache, writeCache } from './cache.js';
+import { isSfc, extractScripts, virtualNameOf } from './sfc.js';
 
 const DAY = 24 * 60 * 60 * 1000;
+const MONTH = 30 * DAY;
 const RESOLVE_EXT = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.json', '.d.ts'];
 // Built-ins we may import to look for a name that the AI put in the wrong module.
 const COMMON_BUILTINS = ['fs', 'fs/promises', 'path', 'util', 'os', 'crypto', 'stream', 'stream/promises', 'events', 'url', 'child_process', 'http', 'https', 'net', 'zlib', 'buffer', 'timers', 'timers/promises', 'assert', 'querystring', 'readline', 'worker_threads', 'process', 'module', 'perf_hooks', 'string_decoder', 'dns'];
@@ -32,8 +35,17 @@ export async function analyze({ files, project, offline = false, deep = true, hi
   // ── 1. Find every package the files use (fast pre-scan, no type checking) ──
   const uses = new Map(); // package name -> [{file, line, column}]
   const builtinsUsed = new Set();
+  // Vue/Svelte/Astro: their scripts become in-memory TS/JS files with identical positions.
+  const virtualOf = new Map(); // original file -> { name, code }
   for (const file of files) {
-    const text = readFileSync(file, 'utf8');
+    if (!isSfc(file)) continue;
+    const { code, lang } = extractScripts(file, readFileSync(file, 'utf8'));
+    virtualOf.set(file, { name: virtualNameOf(file, lang), code });
+  }
+  const sfcVirtualNames = new Set([...virtualOf.values()].map((v) => v.name.replace(/\\/g, '/').toLowerCase()));
+  const programNameOf = (file) => virtualOf.get(file)?.name ?? file;
+  for (const file of files) {
+    const text = virtualOf.get(file)?.code ?? readFileSync(file, 'utf8');
     const lineStarts = lineStartsOf(text);
     for (const imp of ts.preProcessFile(text, true, true).importedFiles) {
       const c = classify(imp.fileName, project.aliasPatterns);
@@ -51,6 +63,19 @@ export async function analyze({ files, project, offline = false, deep = true, hi
     status.set(name, await checkPackage(name, uses.get(name)));
   });
 
+  // Deprecated packages: still "real", but an AI should not be steered toward them.
+  if (!offline) {
+    await pool([...status].filter(([, s]) => (s.state === 'installed' && !s.workspace) || s.state === 'fetched'), 8, async ([name, s]) => {
+      if (!s.version) return;
+      const msg = s.state === 'fetched' ? s.deprecated : await deprecationOf(name, s.version);
+      if (!msg) return;
+      add({
+        ...s.where, severity: 'warning', rule: 'deprecated-package',
+        message: `${name}@${s.version} is deprecated: "${msg.length > 300 ? msg.slice(0, 299) + '…' : msg}"`,
+      });
+    });
+  }
+
   async function checkPackage(name, at) {
     const first = at[0];
     const declared = project.deps.has(name) || name === project.name;
@@ -67,7 +92,10 @@ export async function analyze({ files, project, offline = false, deep = true, hi
           fix: `npm install ${name}`,
         });
       }
-      return { state: 'installed', version };
+      // Workspace packages are symlinks into the repo: they are not on npm, so don't ask about them.
+      let workspace = false;
+      try { workspace = !/[\\/]node_modules[\\/]/.test(realpathSync(installedPath)); } catch { /* ignore */ }
+      return { state: 'installed', version, where, workspace };
     }
 
     if (offline) {
@@ -112,6 +140,17 @@ export async function analyze({ files, project, offline = false, deep = true, hi
       return { state: 'suspicious' };
     }
 
+    // Typosquats: a far more popular package is one or two keystrokes away ("expresss" → express).
+    const twin = (await lookalikes(name).catch(() => [])).find((l) => l.downloads >= 10000 && l.downloads >= 100 * (downloads ?? 0));
+    if (twin) {
+      add({
+        ...where, severity: 'error', rule: 'suspicious-package',
+        message: `"${name}" looks like a typo of "${twin.name}" (${fmt(twin.downloads)} downloads/week vs ${fmt(downloads)}). Typo-named packages are a classic way to ship malware — did you mean ${twin.name}?`,
+        suggestions: [twin.name],
+      });
+      return { state: 'suspicious' };
+    }
+
     if (!declared) {
       add({
         ...where, severity: 'error', rule: 'missing-dependency',
@@ -128,7 +167,7 @@ export async function analyze({ files, project, offline = false, deep = true, hi
       const got = await fetchForInspection(name, range);
       if (!got) throw new Error('no downloadable version');
       fetchedRoots.set(name, got.root);
-      return { state: 'fetched', version: got.version };
+      return { state: 'fetched', version: got.version, where, deprecated: pkg.versions[got.version]?.deprecated || null };
     } catch (e) {
       add({ ...where, severity: 'info', rule: 'not-verified', message: `Could not download "${name}${range ? `@${range}` : ''}" to check its exports: ${e.message}` });
       return { state: 'unknown' };
@@ -168,7 +207,8 @@ export async function analyze({ files, project, offline = false, deep = true, hi
   };
   const depsProbe = join(project.root, '__importprobe_deps__.ts');
   const declaredDeps = [...project.deps.keys()].filter((d) => !d.startsWith('@types/'));
-  const host = virtualHost(options, new Map([[depsProbe, declaredDeps.map((d, i) => `import * as __d${i} from ${JSON.stringify(d)};`).join('\n')]]));
+  // SFC scripts are in-memory; the deps probe file is added later, only if needed.
+  const host = virtualHost(options, new Map([...virtualOf.values()].map((v) => [v.name, v.code])));
   // Same resolution cache tsc uses; without it every lookup walks node_modules again (~3x slower).
   const resolutionCache = ts.createModuleResolutionCache(project.root, (f) => host.getCanonicalFileName(f), options);
   host.resolveModuleNameLiterals = (literals, containingFile, redirectedReference, opts, containingSourceFile) =>
@@ -184,7 +224,7 @@ export async function analyze({ files, project, offline = false, deep = true, hi
   host.getModuleResolutionCache = () => resolutionCache;
 
   const fileSet = new Set(files.map((f) => resolve(f)));
-  const rootNames = [...files, ...project.declarationFiles.filter((f) => !fileSet.has(f))];
+  const rootNames = [...files.map(programNameOf), ...project.declarationFiles.filter((f) => !fileSet.has(f))];
   const program = ts.createProgram({ rootNames, options, host });
   debug(`program created (${program.getSourceFiles().length} files)`);
   if (process.env.IMPORTPROBE_DEBUG === 'files') {
@@ -203,8 +243,25 @@ export async function analyze({ files, project, offline = false, deep = true, hi
   const elsewhereJobs = []; // export names that might live in another package
   const declaredNames = new Map(); // package dir -> text of its declaration files (for JS files)
 
+  // JS adds properties to objects at runtime (`host.cache = …`). Names assigned like that
+  // anywhere in the checked files are not inventions when read elsewhere in JS.
+  const expandos = new Set();
+  if (deep) {
+    const collect = (node) => {
+      if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isPropertyAccessExpression(node.left)) {
+        expandos.add(node.left.name.text);
+      }
+      ts.forEachChild(node, collect);
+    };
+    for (const file of files) {
+      if (!isJsFile(programNameOf(file))) continue;
+      const sf = program.getSourceFile(programNameOf(file));
+      if (sf) collect(sf);
+    }
+  }
+
   for (const file of files) {
-    const sf = program.getSourceFile(file);
+    const sf = program.getSourceFile(programNameOf(file));
     if (!sf) continue;
     const bindings = new Map(); // local symbol -> module info
     const reported = new Set(); // positions already reported (avoid duplicates from the deep pass)
@@ -291,6 +348,8 @@ export async function analyze({ files, project, offline = false, deep = true, hi
     const checkDefault = (mod, nameNode) => {
       // Packages: TypeScript allows synthetic defaults for CommonJS, so only local ES modules are checked.
       if (mod.kind !== 'local' || mod.exportEquals || mod.names.has('default') || !mod.names.size) return;
+      // A component's default export is generated by the Vue/Svelte/Astro compiler.
+      if (sfcVirtualNames.has(mod.declFile.replace(/\\/g, '/').toLowerCase())) return;
       if (isDeclarationFile(mod.declFile)) return;
       add({
         ...loc(nameNode), severity: 'error', rule: 'no-default-export',
@@ -387,7 +446,7 @@ export async function analyze({ files, project, offline = false, deep = true, hi
         if (!owner) continue;
         // Plain JS doesn't narrow (`stmt.moduleSpecifier` on a Statement is fine at runtime).
         // There, only names the package never declares anywhere are reported.
-        if (isJsFile(file) && ownerDeclares(owner, node.name.text)) continue;
+        if (isJsFile(programNameOf(file)) && (expandos.has(node.name.text) || ownerDeclares(owner, node.name.text))) continue;
         reported.add(d.start);
         const app = checker.getApparentType(t);
         const typeName = checker.typeToString(t, undefined, ts.TypeFormatFlags.NoTruncation).replace(/<.*>$/s, '<…>');
@@ -440,16 +499,30 @@ export async function analyze({ files, project, offline = false, deep = true, hi
 
   debug('history hints');
   if (elsewhereJobs.length && hints) {
-    // Export lists of every declared dependency, from a second program that reuses the first one's files.
+    // Export lists of every declared dependency. Cached per installed version; the
+    // ones not cached yet come from a second program that reuses the first one's files.
     const depExports = [];
-    if (declaredDeps.length) {
+    const missing = [];
+    for (const d of declaredDeps) {
+      const dir = findInstalled(d, project.root);
+      let ver = null;
+      try { ver = dir && JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version; } catch { /* ignore */ }
+      const key = ver ? `${d}@${ver}::${d}` : null;
+      const cached = key ? readCache('exports', key, MONTH) : undefined;
+      if (cached) depExports.push({ name: d, values: new Set(cached.values) });
+      else if (cached !== null) missing.push({ d, key });
+    }
+    if (missing.length) {
+      host.setVirtualFile(depsProbe, missing.map((m, i) => `import * as __d${i} from ${JSON.stringify(m.d)};`).join('\n'));
       const p2 = ts.createProgram({ rootNames: [...rootNames, depsProbe], options, host, oldProgram: program });
       const c2 = p2.getTypeChecker();
       const sf2 = p2.getSourceFile(depsProbe);
       sf2?.statements.forEach((st, i) => {
         if (!ts.isImportDeclaration(st)) return;
         const n = moduleNames(c2, st.moduleSpecifier);
-        if (n && !n.any) depExports.push({ name: declaredDeps[i], values: n.values });
+        const ok = n && !n.any;
+        if (ok) depExports.push({ name: missing[i].d, values: n.values });
+        if (missing[i].key) writeCache('exports', missing[i].key, ok ? { names: [...n.names], values: [...n.values] } : null);
       });
     }
     for (const job of elsewhereJobs) {
@@ -467,11 +540,14 @@ export async function analyze({ files, project, offline = false, deep = true, hi
           const names = await loadBuiltin(b);
           if (names?.has(job.name)) homes.push(`node:${b}`);
         }
-        if (homes.length) job.finding.hint = `"${job.name}" is exported by ${homes.slice(0, 3).join(', ')}.`;
-        else if (/Json|Sync$|copy|move|ensure|remove|outputFile|pathExists|emptyDir/i.test(job.name) && /fs/.test(job.from.spec)) {
-          job.finding.hint = `"${job.name}" looks like fs-extra, not Node's fs.`;
+        if (homes.length) {
+          job.finding.hint = `"${job.name}" is exported by ${homes.slice(0, 3).join(', ')}.`;
+          continue;
         }
       }
+      // Popular packages that are not installed here (built-in index, see scripts/build-index.mjs).
+      const known = knownOwners(job.name).filter((p) => p !== fromName && !project.deps.has(p));
+      if (known.length) job.finding.hint = `"${job.name}" is exported by ${known.slice(0, 3).join(', ')}, not by ${job.from.display.replace(/^"|"$/g, '')}.`;
     }
   }
 
@@ -488,6 +564,16 @@ export async function pool(items, size, fn) {
   await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => {
     while (i < items.length) await fn(items[i++]);
   }));
+}
+
+let exportIndex;
+/** Popular packages that export `name`, from the built-in index. */
+function knownOwners(name) {
+  if (exportIndex === undefined) {
+    try { exportIndex = JSON.parse(readFileSync(new URL('./data/export-index.json', import.meta.url), 'utf8')); } catch { exportIndex = null; }
+  }
+  if (!exportIndex || !Object.hasOwn(exportIndex.names, name)) return [];
+  return exportIndex.names[name].map((i) => exportIndex.packages[i]);
 }
 
 function isJsFile(file) {

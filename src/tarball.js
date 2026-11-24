@@ -1,7 +1,7 @@
 import { gunzipSync } from 'node:zlib';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname, normalize, sep } from 'node:path';
-import { cacheDir } from './cache.js';
+import { cacheDir, touch } from './cache.js';
 
 const MAX_TARBALL = 25 * 1024 * 1024;
 const MAX_UNPACKED = 150 * 1024 * 1024;
@@ -18,7 +18,10 @@ export async function fetchPackageFiles(name, version, tarballUrl, root) {
   root ??= join(cacheDir(), 'pkgs', `${name.replace('/', '+')}@${version}`);
   const dest = join(root, 'node_modules', ...name.split('/'));
   const marker = join(dest, '.importprobe-complete');
-  if (existsSync(marker)) return root;
+  if (existsSync(marker)) {
+    touch(marker); // least-recently-used pruning keeps what is still in use
+    return root;
+  }
 
   const res = await fetch(tarballUrl);
   if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`);

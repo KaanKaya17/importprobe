@@ -32,7 +32,74 @@ jobs:
       - run: npm run demo:setup
       - run: npm test
       # importprobe checks its own source (no network needed)
-      - run: node bin/importprobe.js src bin --offline
+      - run: node bin/importprobe.js src bin scripts --offline
+
+  # the GitHub Action (uses: ./) on the sample app full of planted mistakes
+  action:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: cd test/fixtures/ai-app && npm ci --ignore-scripts --no-audit --no-fund
+      - id: probe
+        uses: ./
+        with:
+          path: test/fixtures/ai-app
+          args: --offline
+          fail-on: never
+          sarif: importprobe.sarif
+      - name: Action outputs and SARIF
+        env:
+          ERRORS: ${{ steps.probe.outputs.errors }}
+          WARNINGS: ${{ steps.probe.outputs.warnings }}
+        run: |
+          echo "errors=$ERRORS warnings=$WARNINGS"
+          [ "$ERRORS" -ge 9 ] || { echo "expected the planted mistakes to be found"; exit 1; }
+          node -e 'const s=require("./importprobe.sarif"); if (s.version!=="2.1.0" || !s.runs[0].results.length) throw new Error("bad SARIF")'
+      - name: fail-on=error fails the step
+        id: strict
+        continue-on-error: true
+        uses: ./
+        with:
+          path: test/fixtures/ai-app/src/dates.ts
+          args: --offline
+      - run: '[ "${{ steps.strict.outcome }}" = failure ] || { echo "fail-on=error did not fail"; exit 1; }'
+
+  # server.json must stay valid for the MCP Registry
+  server-json:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.16
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Versions agree
+        run: |
+          node -e '
+            const s = require("./server.json"), p = require("./package.json");
+            if (s.version !== p.version || s.packages[0].version !== p.version) throw new Error("server.json version != package.json");
+            if (s.name !== p.mcpName) throw new Error("server.json name != package.json mcpName");
+          '
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+      - name: mcp-publisher validate
+        run: |
+          set -euo pipefail
+          archive="mcp-publisher_linux_amd64.tar.gz"
+          base="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          curl --fail --location --silent --show-error --output "$archive" "$base/$archive"
+          curl --fail --location --silent --show-error --output "$archive.sigstore.json" "$base/$archive.sigstore.json"
+          cosign verify-blob --bundle "$archive.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" "$archive"
+          tar xzf "$archive" mcp-publisher
+          ./mcp-publisher validate
 
   # install the packed tarball like `npx importprobe` would, then use the installed binary
   package:

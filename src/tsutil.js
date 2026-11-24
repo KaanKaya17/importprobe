@@ -28,6 +28,8 @@ export function virtualHost(options, files) {
     v.has(norm(f)) ? ts.createSourceFile(f, v.get(norm(f)), lang, true) : getSourceFile.call(host, f, lang, onErr, create);
   host.fileExists = (f) => v.has(norm(f)) || fileExists.call(host, f);
   host.readFile = (f) => (v.has(norm(f)) ? v.get(norm(f)) : readFile.call(host, f));
+  /** Add or replace an in-memory file (before creating the next program). */
+  host.setVirtualFile = (p, text) => v.set(norm(p), text);
   return host;
 }
 

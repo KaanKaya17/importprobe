@@ -1,0 +1,13 @@
+---
+import { addDays } from 'date-fns';
+import _ from 'lodash';
+const d = addDays(new Date(), 1);
+_.flatMapDeepest([]);
+---
+<html>
+  <body>{d.toISOString()}</body>
+  <script>
+    import { v4, v9 } from 'uuid';
+    console.log(v4(), v9());
+  </script>
+</html>

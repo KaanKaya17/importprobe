@@ -1,6 +1,7 @@
 {
   "name": "importprobe",
-  "version": "0.1.0",
+  "version": "0.1.1",
+  "mcpName": "io.github.KaanKaya17/importprobe",
   "description": "Catch what your AI coding agent made up: packages that don't exist on npm, exports a package never had, methods that aren't there (even in chains like z.string().emailAddress()), APIs removed in your version, and dependencies missing from package.json. Verifies against the real package — without installing it. CLI, Claude Code hook and MCP server.",
   "type": "module",
   "bin": {

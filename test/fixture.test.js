@@ -37,5 +37,5 @@ test('checks the registry for packages that are not installed', { skip: skip || 
   assert.ok(got.includes('ids.ts:2 missing-dependency'), got.join('\n'));
   assert.ok(got.includes('ids.ts:2 unknown-export'), 'nanoId should be checked against the downloaded nanoid types');
   const fake = result.findings.find((f) => f.rule === 'unknown-package');
-  assert.equal(fake.suggestions[0], 'axios-retry');
+  assert.equal(fake.suggestions[0], 'axios-retry (deprecated)', 'the closest real name comes first, marked when deprecated');
 });

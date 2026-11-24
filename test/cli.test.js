@@ -40,6 +40,18 @@ test('SARIF output', { skip }, async () => {
   assert.equal(s.runs[0].results[0].locations[0].physicalLocation.region.startLine, 2);
 });
 
+test('GitHub annotations and SARIF file in one run', { skip }, async () => {
+  const sarif = join(here, '..', 'node_modules', '.importprobe-test.sarif');
+  const r = await run(['--offline', '--github', '--sarif-file', sarif, join(aiApp, 'src', 'dates.ts')]);
+  assert.equal(r.code, 1);
+  const lines = r.out.trim().split('\n');
+  assert.match(lines[0], /^::error file=.*dates\.ts,line=2,col=10,title=importprobe%3A unknown-export::/);
+  assert.match(lines.at(-1), /2 error\(s\), 0 warning\(s\)/);
+  const { readFileSync, rmSync } = await import('node:fs');
+  assert.equal(JSON.parse(readFileSync(sarif, 'utf8')).runs[0].results.length, 2);
+  rmSync(sarif, { force: true });
+});
+
 test('Claude Code hook: exit 2 with feedback on bad files, silent on good ones', { skip }, async () => {
   const bad = await run(['hook', '--offline'], JSON.stringify({ tool_name: 'Write', tool_input: { file_path: join(aiApp, 'src', 'files.js') } }));
   assert.equal(bad.code, 2);

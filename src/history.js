@@ -1,12 +1,24 @@
 import { getPackage, compareSemver } from './registry.js';
 import { fetchForInspection } from './inspect.js';
 import { namesInRoot } from './tsutil.js';
+import { readCache, writeCache } from './cache.js';
 
 const major = (v) => Number(v.split('.')[0]);
+const MONTH = 30 * 24 * 60 * 60 * 1000;
 
-async function namesAt(name, version, spec) {
+/**
+ * Export names of `spec` in a published version, cached on disk: a published
+ * version never changes, so this is computed once per (package, version, spec).
+ */
+export async function namesAt(name, version, spec) {
+  const key = `${name}@${version}::${spec}`;
+  const cached = readCache('exports', key, MONTH);
+  if (cached !== undefined) return cached && { names: new Set(cached.names), values: new Set(cached.values) };
   const got = await fetchForInspection(name, version);
-  return got ? namesInRoot(got.root, spec) : null;
+  const n = got ? namesInRoot(got.root, spec) : null;
+  const plain = n && !n.any ? { names: [...n.names], values: [...n.values] } : null;
+  writeCache('exports', key, plain);
+  return plain && { names: new Set(plain.names), values: new Set(plain.values) };
 }
 
 /**

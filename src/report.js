@@ -96,6 +96,38 @@ export function formatSarif(result, { cwd = process.cwd(), version = '' } = {}) 
   }, null, 2);
 }
 
+const ghData = (s) => String(s).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+const ghProp = (s) => ghData(s).replace(/:/g, '%3A').replace(/,/g, '%2C');
+
+/**
+ * GitHub Actions workflow commands: each finding becomes an annotation on the
+ * changed line of the pull request. Also returns a Markdown job summary.
+ */
+export function formatGithub(result, { cwd = process.cwd(), version = '' } = {}) {
+  const lines = [];
+  const rows = [];
+  for (const f of result.findings) {
+    if (f.severity === 'info') continue;
+    const file = relative(cwd, f.file).replace(/\\/g, '/');
+    const extra = [f.hint, f.suggestions?.length ? `Did you mean: ${f.suggestions.join(', ')}?` : '', f.fix ? `Fix: ${f.fix}` : ''].filter(Boolean).join(' ');
+    const level = f.severity === 'error' ? 'error' : 'warning';
+    lines.push(`::${level} file=${ghProp(file)},line=${f.line},col=${f.column},title=${ghProp(`importprobe: ${f.rule}`)}::${ghData(extra ? `${f.message}\n${extra}` : f.message)}`);
+    rows.push(`| ${level === 'error' ? '✖' : '⚠'} | \`${file}:${f.line}\` | ${f.message.replace(/\|/g, '\\|')}${extra ? `<br>${extra.replace(/\|/g, '\\|')}` : ''} |`);
+  }
+  const errors = result.findings.filter((f) => f.severity === 'error').length;
+  const warnings = result.findings.filter((f) => f.severity === 'warning').length;
+  lines.push(`importprobe ${version}: ${result.files} file(s), ${result.imports} import(s) — ${errors} error(s), ${warnings} warning(s)`);
+  const summary = [
+    `### importprobe ${version}`,
+    '',
+    rows.length
+      ? `${errors} error(s), ${warnings} warning(s) in ${result.files} file(s).\n\n| | Where | What |\n|---|---|---|\n${rows.join('\n')}`
+      : `✔ All ${result.imports} imports in ${result.files} file(s) point at things that exist.`,
+    '',
+  ].join('\n');
+  return { text: lines.join('\n'), summary };
+}
+
 /** Short plain text an AI agent can act on (used by the hook). */
 export function formatForAgent(result, { cwd = process.cwd() } = {}) {
   const lines = ['importprobe found imports that do not match reality. Fix them before continuing:'];

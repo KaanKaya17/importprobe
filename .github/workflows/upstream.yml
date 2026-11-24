@@ -1,0 +1,46 @@
+name: Upstream
+# Weekly: run the test suite against the NEWEST versions of everything the sample apps use
+# (React, zod, express, …) and the newest typescript 6.x. Libraries change their APIs;
+# this finds out before users do. A failure opens (or updates) one issue.
+on:
+  schedule:
+    - cron: '17 6 * * 1' # Mondays 06:17 UTC
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Newest dependencies (install scripts never run)
+        run: |
+          npm install --ignore-scripts --no-audit --no-fund typescript@~6
+          for app in test/fixtures/ai-app test/fixtures/real-app; do
+            deps=$(node -p "const p=require('./$app/package.json'); Object.keys({...p.dependencies,...p.devDependencies}).map(d=>d+'@latest').join(' ')")
+            (cd "$app" && rm -f package-lock.json && npm install --ignore-scripts --no-audit --no-fund $deps)
+          done
+          npm ls --depth=0 typescript
+      - id: test
+        run: npm test
+      - name: Self-check
+        run: node bin/importprobe.js src bin scripts --offline
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Upstream check failed: newest library versions break the tests"
+          body="The weekly run against the newest versions failed: $RUN_URL"
+          n=$(gh issue list --state open --search "in:title \"$title\"" --json number -q '.[0].number')
+          if [ -n "$n" ]; then gh issue comment "$n" --body "$body"; else gh issue create --title "$title" --body "$body"; fi
