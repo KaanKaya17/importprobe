@@ -60,7 +60,7 @@ jobs:
         run: |
           echo "errors=$ERRORS warnings=$WARNINGS"
           [ "$ERRORS" -eq 8 ] && [ "$WARNINGS" -eq 3 ] || { echo "expected 8 errors + 3 warnings (offline) from the planted mistakes"; exit 1; }
-          node -e 'const s=require("./importprobe.sarif"); if (s.version!=="2.1.0" || !s.runs[0].results.length) throw new Error("bad SARIF")'
+          node -e 'const s=JSON.parse(require("fs").readFileSync("importprobe.sarif","utf8")); if (s.version!=="2.1.0" || !s.runs[0].results.length) throw new Error("bad SARIF")'
       - name: fail-on=error fails the step
         id: strict
         continue-on-error: true
