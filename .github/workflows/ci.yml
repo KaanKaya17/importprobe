@@ -59,7 +59,7 @@ jobs:
           WARNINGS: ${{ steps.probe.outputs.warnings }}
         run: |
           echo "errors=$ERRORS warnings=$WARNINGS"
-          [ "$ERRORS" -ge 9 ] || { echo "expected the planted mistakes to be found"; exit 1; }
+          [ "$ERRORS" -eq 8 ] && [ "$WARNINGS" -eq 3 ] || { echo "expected 8 errors + 3 warnings (offline) from the planted mistakes"; exit 1; }
           node -e 'const s=require("./importprobe.sarif"); if (s.version!=="2.1.0" || !s.runs[0].results.length) throw new Error("bad SARIF")'
       - name: fail-on=error fails the step
         id: strict
