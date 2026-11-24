@@ -1,0 +1,60 @@
+name: Release
+# Push a tag like v0.2.0 (matching package.json) to release.
+#
+# npm: Trusted Publishing (OIDC), STAGE-ONLY — no token stored anywhere, and nothing goes live
+# without a human. The workflow uploads the version with `npm stage publish`; a maintainer then
+# approves it on npmjs.com (package → Staged Packages) or with `npm stage approve <id>`, both with 2FA.
+# Trusted publisher on npmjs.com: GitHub Actions, KaanKaya17/importprobe, release.yml,
+# "Allow npm publish" unchecked. Private repositories skip npm entirely.
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # GitHub release
+      id-token: write # OIDC for npm trusted publishing
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22 # staged publishing needs Node >= 22.14
+          registry-url: https://registry.npmjs.org
+      - name: Tag matches package.json
+        run: |
+          v=$(node -p "require('./package.json').version")
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != package.json v$v"; exit 1; }
+      - run: npm ci --ignore-scripts
+      - run: npm run demo:setup
+      - run: npm test
+      - run: node test/package-smoke.mjs
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          awk -v h="## [$v]" 'index($0, h) == 1 {f=1; next} index($0, "## [") == 1 {f=0} f' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "CHANGELOG.md has no section for $v"; exit 1; }
+      - name: Stage on npm (a maintainer approves it with 2FA)
+        if: github.event.repository.private == false
+        run: |
+          v=$(node -p "require('./package.json').version")
+          # already live (e.g. the very first version, published by hand): nothing to do
+          if npm view "importprobe@$v" version >/dev/null 2>&1; then
+            echo "::notice::importprobe@$v is already on npm, skipping."
+            exit 0
+          fi
+          npm install -g npm@11.18.0 # staged publishing needs npm >= 11.15
+          npm stage publish --access public
+          echo "::notice::importprobe@$v is staged. Approve it on https://www.npmjs.com/package/importprobe (Staged Packages) to make it live."
+      - name: npm skipped (private repository)
+        if: github.event.repository.private == true
+        run: echo "::notice::Repository is private, so nothing was staged on npm."
+      - name: GitHub release
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag || gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}

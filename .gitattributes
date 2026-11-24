@@ -1,0 +1,4 @@
+# Keep LF everywhere: the bin shebang must not end in \r, and fixtures are line/column exact
+* text=auto eol=lf
+*.png binary
+*.jpg binary

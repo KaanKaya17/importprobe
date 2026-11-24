@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # keeps the SHA-pinned actions current (the "# vX.Y.Z" comments are updated too)
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    # TypeScript 7 (native) has no stable JS compiler API yet; importprobe needs typescript@6.
+    ignore:
+      - dependency-name: typescript
+        update-types: ['version-update:semver-major']
